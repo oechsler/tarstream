@@ -51,11 +51,12 @@ func main() {
 	// basics
 	src := flag.String("src", "", "Source directory")
 	out := flag.String("out", "-", "Output file or '-' for stdout")
+	verbose := flag.Bool("v", false, "Verbose: log file names")
 
 	// flapping prevention
 	stability := flag.String("stability", "on", "Flapping prevention: on|off")
 	stabMS := flag.Int("stability-ms", 200, "Stability window per check (ms)")
-	retries := flag.Int("retries", -1, "Max retries to obtain a stable snapshot (-1 = infinite, default)")
+	retries := flag.Int("retries", -1, "Max retries to obtain a stable snapshot (-1 = infinite)")
 	onChange := flag.String("on-change", "snapshot", "Policy for changing files: snapshot|skip|fail")
 
 	// progress & totals
@@ -107,7 +108,7 @@ func main() {
 	var pruneGlob string
 	if *out != "-" {
 		expanded := strftimeLike(*out, time.Now())
-		pruneGlob = templateToGlob(*out)
+		pruneGlob = templateToGlob(*out) // auto-derive pruning glob
 		if dir := filepath.Dir(expanded); dir != "." && dir != "" {
 			if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
 				fail(mkerr)
@@ -144,7 +145,6 @@ func main() {
 	var plannedFiles int64
 	if mode != preNone {
 		startPS := time.Now()
-		// If stability is off, treat "stable" prescan as "fast"
 		effectiveMode := mode
 		if !stabilityOn && mode == preStable {
 			effectiveMode = preFast
@@ -298,12 +298,9 @@ func main() {
 						return nil
 					}
 				}
-			} else {
-				// stability off: do nothing extra; we'll copy exactly snap.Size() bytes,
-				// padding zeros if short to keep tar valid; if file grows, extra bytes are ignored.
-			}
+			} // else: single stat behavior already set
 
-			// header from (snap)shot or single stat
+			// header from snapshot or single stat
 			h, err := tar.FileInfoHeader(snap, "")
 			if err != nil {
 				return err
@@ -316,7 +313,11 @@ func main() {
 			// per-file logging
 			fileSize := h.Size
 			fileStart := time.Now()
-			log.Printf("start: %s size=%s", name, humanBytes(fileSize))
+			if *verbose {
+				log.Printf("start: %s size=%s", name, humanBytes(fileSize))
+			} else {
+				log.Printf("start: %s size=%s", name, humanBytes(fileSize))
+			}
 
 			wrote, err := copyExactWithProgress(
 				ctx, tw, in, fileSize,
@@ -436,7 +437,7 @@ func main() {
 		fail(walkErr)
 	}
 
-	// simple prune: keep newest N by mtime
+	// simple prune: keep EXACTLY newest N by mtime, always include current
 	if *keep > 0 && outPath != "" {
 		pattern := pruneGlob
 		if pattern == "" {
@@ -475,8 +476,7 @@ func copyExactWithProgress(
 
 	var ticker *time.Ticker
 	if interval > 0 {
-		ticker = new(time.Ticker)
-		*ticker = *time.NewTicker(interval)
+		ticker = time.NewTicker(interval) // IMPORTANT: do not copy ticker
 		defer ticker.Stop()
 	}
 
@@ -740,7 +740,6 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 	sort.Slice(items, func(i, j int) bool { return items[i].mt.After(items[j].mt) })
 
 	if len(items) <= keep {
-		// Ensure current included; nothing to delete anyway
 		return 0, 0, nil
 	}
 
