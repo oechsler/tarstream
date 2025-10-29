@@ -52,7 +52,8 @@ func main() {
 	src := flag.String("src", "", "Source directory")
 	out := flag.String("out", "-", "Output file or '-' for stdout")
 
-	// anti-flap (defaults: infinite retries)
+	// flapping prevention
+	stability := flag.String("stability", "on", "Flapping prevention: on|off")
 	stabMS := flag.Int("stability-ms", 200, "Stability window per check (ms)")
 	retries := flag.Int("retries", -1, "Max retries to obtain a stable snapshot (-1 = infinite, default)")
 	onChange := flag.String("on-change", "snapshot", "Policy for changing files: snapshot|skip|fail")
@@ -62,7 +63,7 @@ func main() {
 	inline := flag.Bool("inline", false, "Inline progress on a single line (carriage return)")
 	prescan := flag.String("prescan", "fast", "Prescan mode for total size: none|fast|stable")
 
-	// SIMPLE PRUNING: keep newest N by mtime (auto-glob from -out template)
+	// simple pruning
 	keep := flag.Int("keep", 0, "Keep newest N archives by mtime (0 disables pruning)")
 
 	flag.Parse()
@@ -84,6 +85,7 @@ func main() {
 	default:
 		fail(fmt.Errorf("invalid -prescan: %q (use none|fast|stable)", *prescan))
 	}
+	stabilityOn := strings.ToLower(*stability) != "off"
 
 	// parse interval
 	var progEvery time.Duration
@@ -105,7 +107,6 @@ func main() {
 	var pruneGlob string
 	if *out != "-" {
 		expanded := strftimeLike(*out, time.Now())
-		// derive prune glob from the *template* (convert %... to *) so all dated files match
 		pruneGlob = templateToGlob(*out)
 		if dir := filepath.Dir(expanded); dir != "." && dir != "" {
 			if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
@@ -143,16 +144,21 @@ func main() {
 	var plannedFiles int64
 	if mode != preNone {
 		startPS := time.Now()
-		totalPlanned, plannedFiles, err = planTotals(ctx, srcAbs, mode, time.Duration(*stabMS)*time.Millisecond, *retries)
+		// If stability is off, treat "stable" prescan as "fast"
+		effectiveMode := mode
+		if !stabilityOn && mode == preStable {
+			effectiveMode = preFast
+		}
+		totalPlanned, plannedFiles, err = planTotals(ctx, srcAbs, effectiveMode, time.Duration(*stabMS)*time.Millisecond, *retries, stabilityOn)
 		if err != nil {
 			fail(fmt.Errorf("prescan failed: %w", err))
 		}
 		note := ""
-		if mode == preFast {
+		if effectiveMode == preFast {
 			note = " — note: totals are estimates"
 		}
 		log.Printf("prescan: files=%d bytes=%s (mode=%s, elapsed=%s)%s",
-			plannedFiles, humanBytes(totalPlanned), mode, time.Since(startPS).Truncate(time.Millisecond), note)
+			plannedFiles, humanBytes(totalPlanned), effectiveMode, time.Since(startPS).Truncate(time.Millisecond), note)
 	}
 
 	// overall progress
@@ -213,23 +219,35 @@ func main() {
 
 		// regular file
 		if d.Type().IsRegular() {
-			// anti-flap snapshot (ctx-aware, infinite retries by default)
-			snap, ok, err := stableSnapshot(ctx, pathFS, time.Duration(*stabMS)*time.Millisecond, *retries)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return errAborted
+			var snap os.FileInfo
+			var ok bool
+
+			if stabilityOn {
+				// anti-flap snapshot (ctx-aware, infinite retries by default)
+				snap, ok, err = stableSnapshot(ctx, pathFS, time.Duration(*stabMS)*time.Millisecond, *retries)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return errAborted
+					}
+					return err
 				}
-				return err
-			}
-			if !ok {
-				msg := fmt.Sprintf("unstable file: %s (could not stabilize)", name)
-				switch policy {
-				case polSkip, polSnapshot:
-					log.Printf("warn: %s — skipping", msg)
-					return nil
-				case polFail:
-					return errors.New(msg)
+				if !ok {
+					msg := fmt.Sprintf("unstable file: %s (could not stabilize)", name)
+					switch policy {
+					case polSkip, polSnapshot:
+						log.Printf("warn: %s — skipping", msg)
+						return nil
+					case polFail:
+						return errors.New(msg)
+					}
 				}
+			} else {
+				// stability off: single stat, copy as-is (with safety to keep tar valid)
+				snap, err = os.Stat(pathFS)
+				if err != nil {
+					return err
+				}
+				ok = true
 			}
 
 			in, err := os.Open(pathFS)
@@ -238,48 +256,54 @@ func main() {
 			}
 			defer in.Close()
 
-			cur, err := in.Stat()
-			if err != nil {
-				return err
-			}
-			if cur.Size() != snap.Size() || !cur.ModTime().Equal(snap.ModTime()) {
-				if policy == polFail {
-					return fmt.Errorf("file changed before copy: %s", name)
+			if stabilityOn {
+				// ensure unchanged vs snapshot before copying
+				cur, err := in.Stat()
+				if err != nil {
+					return err
 				}
-				if policy == polSnapshot {
-					in.Close()
-					snap2, ok2, err2 := stableSnapshot(ctx, pathFS, time.Duration(*stabMS)*time.Millisecond, *retries)
-					if err2 != nil {
-						if errors.Is(err2, context.Canceled) {
-							return errAborted
+				if cur.Size() != snap.Size() || !cur.ModTime().Equal(snap.ModTime()) {
+					if policy == polFail {
+						return fmt.Errorf("file changed before copy: %s", name)
+					}
+					if policy == polSnapshot {
+						in.Close()
+						snap2, ok2, err2 := stableSnapshot(ctx, pathFS, time.Duration(*stabMS)*time.Millisecond, *retries)
+						if err2 != nil {
+							if errors.Is(err2, context.Canceled) {
+								return errAborted
+							}
+							return err2
 						}
-						return err2
-					}
-					if !ok2 {
-						log.Printf("warn: unstable file: %s — skipping", name)
+						if !ok2 {
+							log.Printf("warn: unstable file: %s — skipping", name)
+							return nil
+						}
+						in, err = os.Open(pathFS)
+						if err != nil {
+							return err
+						}
+						defer in.Close()
+						cur, err = in.Stat()
+						if err != nil {
+							return err
+						}
+						if cur.Size() != snap2.Size() || !cur.ModTime().Equal(snap2.ModTime()) {
+							log.Printf("warn: still changing: %s — skipping", name)
+							return nil
+						}
+						snap = snap2
+					} else { // polSkip
+						log.Printf("warn: file changed before copy: %s — skipping", name)
 						return nil
 					}
-					in, err = os.Open(pathFS)
-					if err != nil {
-						return err
-					}
-					defer in.Close()
-					cur, err = in.Stat()
-					if err != nil {
-						return err
-					}
-					if cur.Size() != snap2.Size() || !cur.ModTime().Equal(snap2.ModTime()) {
-						log.Printf("warn: still changing: %s — skipping", name)
-						return nil
-					}
-					snap = snap2
-				} else { // polSkip
-					log.Printf("warn: file changed before copy: %s — skipping", name)
-					return nil
 				}
+			} else {
+				// stability off: do nothing extra; we'll copy exactly snap.Size() bytes,
+				// padding zeros if short to keep tar valid; if file grows, extra bytes are ignored.
 			}
 
-			// header from snapshot
+			// header from (snap)shot or single stat
 			h, err := tar.FileInfoHeader(snap, "")
 			if err != nil {
 				return err
@@ -412,14 +436,13 @@ func main() {
 		fail(walkErr)
 	}
 
-	// SIMPLE PRUNE: keep newest N by mtime (auto glob from -out template)
+	// simple prune: keep newest N by mtime
 	if *keep > 0 && outPath != "" {
 		pattern := pruneGlob
 		if pattern == "" {
-			// fallback: match exact file (no pruning)
 			pattern = outPath
 		}
-		deleted, skipped, perr := pruneKeepNewestByMTime(pattern, *keep, outPath)
+		deleted, skipped, perr := pruneKeepExactlyNewestByMTime(pattern, *keep, outPath)
 		if perr != nil {
 			log.Printf("prune: error: %v", perr)
 		} else {
@@ -452,7 +475,8 @@ func copyExactWithProgress(
 
 	var ticker *time.Ticker
 	if interval > 0 {
-		ticker = time.NewTicker(interval)
+		ticker = new(time.Ticker)
+		*ticker = *time.NewTicker(interval)
 		defer ticker.Stop()
 	}
 
@@ -519,7 +543,7 @@ func copyExactWithProgress(
 }
 
 // planTotals prescans to estimate or determine total bytes and file count.
-func planTotals(ctx context.Context, root string, mode prescanMode, delay time.Duration, retries int) (int64, int64, error) {
+func planTotals(ctx context.Context, root string, mode prescanMode, delay time.Duration, retries int, stabilityOn bool) (int64, int64, error) {
 	var total int64
 	var count int64
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, inErr error) error {
@@ -544,6 +568,16 @@ func planTotals(ctx context.Context, root string, mode prescanMode, delay time.D
 				total += info.Size()
 				count++
 			case preStable:
+				if !stabilityOn {
+					// treat as fast if stability is disabled
+					info, err := d.Info()
+					if err != nil {
+						return err
+					}
+					total += info.Size()
+					count++
+					return nil
+				}
 				snap, ok, err := stableSnapshot(ctx, p, delay, retries)
 				if err != nil {
 					if errors.Is(err, context.Canceled) {
@@ -631,19 +665,16 @@ func strftimeLike(tpl string, t time.Time) string {
 }
 
 // templateToGlob converts an -out template (with % tokens) into a glob pattern.
-// Every %... token becomes '*', and '%%' (literal %) also becomes '*'.
+// Every %... token becomes '*', and '%%' also becomes '*'.
 func templateToGlob(tpl string) string {
 	var b strings.Builder
 	runes := []rune(tpl)
 	for i := 0; i < len(runes); i++ {
 		if runes[i] == '%' {
-			// treat any %-sequence as a wildcard
-			// consume the next rune if present (handles %Y, %F, %:z, %% ... all → *)
 			b.WriteRune('*')
-			// skip optional colon in %:z
-			if i+1 < len(runes) && (runes[i+1] == ':' || (runes[i+1] >= 'A' && runes[i+1] <= 'z')) {
+			// consume following token rune(s) loosely
+			if i+1 < len(runes) {
 				i++
-				// also skip one more for %:z style
 				if i+1 < len(runes) && runes[i] == ':' {
 					i++
 				}
@@ -679,10 +710,9 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-// pruneKeepNewestByMTime keeps exactly 'keep' newest files by mtime.
-// If 'current' isn't among the newest N, it replaces the oldest keeper,
-// so the total kept is still exactly N.
-func pruneKeepNewestByMTime(pattern string, keep int, current string) (deleted int, skippedCurrent int, err error) {
+// pruneKeepExactlyNewestByMTime keeps exactly 'keep' newest files by mtime,
+// ensuring the current file is included; deletes the rest.
+func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (deleted int, skippedCurrent int, err error) {
 	if keep < 0 {
 		keep = 0
 	}
@@ -703,7 +733,6 @@ func pruneKeepNewestByMTime(pattern string, keep int, current string) (deleted i
 		items = append(items, item{path: p, mt: fi.ModTime()})
 	}
 	if len(items) == 0 || keep == 0 {
-		// If keep==0 we won't prune here (upper layer usually guards this).
 		return 0, 0, nil
 	}
 
@@ -711,17 +740,17 @@ func pruneKeepNewestByMTime(pattern string, keep int, current string) (deleted i
 	sort.Slice(items, func(i, j int) bool { return items[i].mt.After(items[j].mt) })
 
 	if len(items) <= keep {
-		// Nothing to prune
+		// Ensure current included; nothing to delete anyway
 		return 0, 0, nil
 	}
 
-	// Build set of keepers: first 'keep' items by mtime
+	// Build keep set (first N)
 	keepSet := make(map[int]struct{}, keep)
 	for i := 0; i < keep && i < len(items); i++ {
 		keepSet[i] = struct{}{}
 	}
 
-	// Ensure 'current' is kept: if it's not in top N, replace the oldest keeper
+	// Ensure 'current' is kept
 	if current != "" {
 		absCur, _ := filepath.Abs(current)
 		curIdx := -1
@@ -734,7 +763,7 @@ func pruneKeepNewestByMTime(pattern string, keep int, current string) (deleted i
 		}
 		if curIdx >= 0 {
 			if _, ok := keepSet[curIdx]; !ok {
-				// Replace the oldest among current keepers (largest index in keepSet)
+				// Replace the oldest keeper (largest index in keepSet)
 				oldestIdx := -1
 				for i := range keepSet {
 					if i > oldestIdx {
@@ -743,21 +772,18 @@ func pruneKeepNewestByMTime(pattern string, keep int, current string) (deleted i
 				}
 				if oldestIdx >= 0 {
 					delete(keepSet, oldestIdx)
-					keepSet[curIdx] = struct{}{}
-				} else {
-					// Fallback: if somehow empty, just add current
-					keepSet[curIdx] = struct{}{}
 				}
+				keepSet[curIdx] = struct{}{}
 			}
 		}
 	}
 
-	// Delete everything not in keepSet
+	// Delete the rest
 	for i, it := range items {
 		if _, keep := keepSet[i]; keep {
 			continue
 		}
-		// Count if we skipped deleting 'current' (shouldn't happen now, but safe)
+		// safety (shouldn't trigger now)
 		if current != "" {
 			absCur, _ := filepath.Abs(current)
 			absPath, _ := filepath.Abs(it.path)
