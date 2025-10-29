@@ -62,7 +62,7 @@ func main() {
 	// progress & totals
 	progress := flag.String("progress", "10s", "Per-file progress interval (e.g. 5s, 30s; 0 to disable interim updates)")
 	inline := flag.Bool("inline", false, "Inline progress on a single line (carriage return)")
-	prescan := flag.String("prescan", "fast", "Prescan mode for total size: none|fast|stable")
+	prescan := flag.String("prescan", "none", "Prescan mode for total size: none|fast|stable")
 
 	// simple pruning
 	keep := flag.Int("keep", 0, "Keep newest N archives by mtime (0 disables pruning)")

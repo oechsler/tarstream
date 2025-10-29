@@ -7,4 +7,5 @@ FROM alpine:latest
 WORKDIR /backup
 RUN mkdir -p /backup /archive
 COPY --from=build /tarstream /tarstream
-ENTRYPOINT ["/tarstream", "-src", "/backup", "-out", "/archive/backup-%Y-%m-%d-%H-%M-%S.tar.gz", "-keep", "3"]
+ENTRYPOINT ["/tarstream"]
+CMD ["-src", "/backup", "-out", "/archive/backup-%Y-%m-%d-%H-%M-%S.tar.gz", "-keep", "3"]
