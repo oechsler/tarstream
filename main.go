@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/klauspost/pgzip"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -30,31 +32,56 @@ type fileJob struct {
 	pw   *io.PipeWriter
 }
 
-type logEvent struct {
-	Kind    string
-	Path    string
-	Size    int64
-	Read    int64
-	Padded  int64
-	Elapsed time.Duration
-	Err     error
-}
-
 func main() {
 	// ---- Flags ----
 	src := flag.String("src", "", "Source directory (required)")
 	outTpl := flag.String("out", "", "Output path template with time placeholders (required), e.g. backups/%F_%T.tar.gz")
 	keep := flag.Int("keep", 0, "Keep exactly N newest archives by mtime (0 disables pruning)")
+
 	logFile := flag.String("logfile", "", "Optional log file path (defaults to stderr)")
+	logJSON := flag.Bool("log-json", true, "Log as JSON (true) or pretty console (false)")
+	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
+	logInterval := flag.Duration("log-interval", 10*time.Second, "Periodic summary interval (0 disables)")
+	logHeaders := flag.Bool("log-headers", false, "Also log non-regular entries (dirs/symlinks)")
 	flag.Parse()
 
 	if *src == "" || *outTpl == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -src <dir> -out <template> [-keep N] [-logfile path]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s -src <dir> -out <template> [-keep N] [-logfile path] [-log-json bool] [-log-level L] [-log-interval 10s] [-log-headers]\n", os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 
-	// Final output name and temp (partial) name
+	// ---- Logger Setup (zerolog) ----
+	var out io.Writer = os.Stderr
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "logfile open failed (%v), using stderr\n", err)
+		} else {
+			out = f
+			defer f.Close()
+		}
+	}
+	if *logJSON {
+		zerolog.TimeFieldFormat = time.RFC3339Nano
+		log.Logger = zerolog.New(out).With().Timestamp().Logger()
+	} else {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: out, TimeFormat: "15:04:05"})
+	}
+	switch strings.ToLower(*logLevel) {
+	case "debug":
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	case "info":
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	case "warn":
+		zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	case "error":
+		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+	default:
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
+
+	// Final output + temp partial
 	outPath := strftimeLike(*outTpl, time.Now())
 	tmpPath := outPath + ".partial"
 	if dir := filepath.Dir(outPath); dir != "." && dir != "" {
@@ -63,22 +90,22 @@ func main() {
 		}
 	}
 
-	// Context cancels on SIGINT/SIGTERM -> ensures cleanup
+	// Context with signals
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	eg, ctx := errgroup.WithContext(ctx)
 
-	// Open temp output; ensure removal on any failure/abort
+	// Open temp writer
 	tmpF, err := os.Create(tmpPath)
 	if err != nil {
 		fail(err)
 	}
 	committed := false
 	defer func() {
-		// If we didn't rename successfully, remove partial
 		if !committed {
 			_ = tmpF.Close()
 			_ = os.Remove(tmpPath)
+			log.Warn().Str("tmp", tmpPath).Msg("removed partial file")
 		}
 	}()
 
@@ -89,57 +116,49 @@ func main() {
 	tw := tar.NewWriter(gzw)
 	defer tw.Close()
 
-	// ----- Async logger -----
-	logCh := make(chan logEvent, 2048)
-	var dropped uint64
-	eg.Go(func() error {
-		var w io.Writer = os.Stderr
-		if *logFile != "" {
-			if lf, e := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); e == nil {
-				defer lf.Close()
-				w = lf
-			} else {
-				fmt.Fprintf(os.Stderr, "logfile open failed (%v), using stderr\n", e)
-			}
-		}
-		for ev := range logCh {
-			switch ev.Kind {
-			case "header":
-				typ := "other"
-				if strings.HasSuffix(ev.Path, "/") {
-					typ = "dir"
+	// ---- Metrics for periodic summaries ----
+	var filesDone int64
+	var bytesRead int64
+	var bytesPadded int64
+	startTime := time.Now()
+
+	// Periodic summary ticker (non-blocking)
+	if *logInterval > 0 {
+		interval := *logInterval
+		eg.Go(func() error {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			var lastBytes int64
+			var lastTime = time.Now()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case t := <-ticker.C:
+					total := atomic.LoadInt64(&bytesRead)
+					deltaBytes := total - lastBytes
+					deltaSecs := t.Sub(lastTime).Seconds()
+					speed := float64(deltaBytes)
+					if deltaSecs > 0 {
+						speed = speed / deltaSecs
+					}
+					log.Info().
+						Int64("files", atomic.LoadInt64(&filesDone)).
+						Str("bytes", humanBytes(total)).
+						Str("padded", humanBytes(atomic.LoadInt64(&bytesPadded))).
+						Str("speed", humanBytes(int64(speed))+"/s").
+						Str("elapsed", time.Since(startTime).Truncate(time.Second).String()).
+						Msg("progress")
+					lastBytes = total
+					lastTime = t
 				}
-				fmt.Fprintf(w, "header: %s type=%s\n", ev.Path, typ)
-			case "copy":
-				if ev.Err != nil {
-					fmt.Fprintf(w, "copy:   %s size=%d read=%d padded=%d elapsed=%s ERROR=%v\n",
-						ev.Path, ev.Size, ev.Read, ev.Padded, ev.Elapsed.Truncate(time.Millisecond), ev.Err)
-				} else {
-					fmt.Fprintf(w, "copy:   %s size=%d read=%d padded=%d elapsed=%s\n",
-						ev.Path, ev.Size, ev.Read, ev.Padded, ev.Elapsed.Truncate(time.Millisecond))
-				}
-			default:
-				fmt.Fprintf(w, "log: %s\n", ev.Path)
 			}
-		}
-		if d := atomic.LoadUint64(&dropped); d > 0 {
-			fmt.Fprintf(w, "log: dropped %d events (logger buffer full)\n", d)
-		}
-		return nil
-	})
-	logAsync := func(ev logEvent) {
-		select {
-		case logCh <- ev:
-		default:
-			atomic.AddUint64(&dropped, 1)
-		}
+		})
 	}
 
-	// Work & order channels
+	// Channels & pools
 	workCh := make(chan *fileJob, runtime.GOMAXPROCS(0)*2)
 	orderCh := make(chan *fileJob, runtime.GOMAXPROCS(0)*2)
-
-	// Buffer pool
 	var bufPool = sync.Pool{New: func() any { b := make([]byte, 256*1024); return &b }}
 
 	// Workers: stream file -> pipe
@@ -159,7 +178,7 @@ func main() {
 		})
 	}
 
-	// Writer: headers + exact bytes from pipe in order
+	// Writer: headers + exact bytes from pipe (ordered)
 	eg.Go(func() error {
 		for job := range orderCh {
 			rel, _ := filepath.Rel(*src, job.path)
@@ -185,27 +204,38 @@ func main() {
 				return err
 			}
 
+			// Only regular files have data
 			if !job.info.Mode().IsRegular() || hdr.Size == 0 {
-				logAsync(logEvent{Kind: "header", Path: name})
+				if *logHeaders {
+					log.Debug().Str("path", name).Str("type", entryType(job.info)).Msg("header")
+				}
 				job.pr.Close()
 				continue
 			}
 
+			// Copy exactly hdr.Size bytes; record metrics
 			start := time.Now()
 			buf := *bufPool.Get().(*[]byte)
 			read, padded, cErr := copyExactly(ctx, tw, job.pr, hdr.Size, buf)
 			bufPool.Put(&buf)
 			job.pr.Close()
 
-			logAsync(logEvent{
-				Kind:    "copy",
-				Path:    name,
-				Size:    hdr.Size,
-				Read:    read,
-				Padded:  padded,
-				Elapsed: time.Since(start),
-				Err:     cErr,
-			})
+			atomic.AddInt64(&bytesRead, read)
+			if padded > 0 {
+				atomic.AddInt64(&bytesPadded, padded)
+			}
+			atomic.AddInt64(&filesDone, 1)
+
+			evt := log.Info()
+			if cErr != nil {
+				evt = log.Error().Err(cErr)
+			}
+			evt.Str("path", name).
+				Int64("size", hdr.Size).
+				Int64("read", read).
+				Int64("padded", padded).
+				Str("elapsed", time.Since(start).Truncate(time.Millisecond).String()).
+				Msg("file")
 			if cErr != nil {
 				return cErr
 			}
@@ -242,43 +272,44 @@ func main() {
 		})
 	})
 
-	// Wait for pipeline (cancels on signal)
+	// Wait (will cancel on signal)
 	if err := eg.Wait(); err != nil {
-		// close logger and exit; deferred cleanup removes tmp
-		close(logCh)
-		fail(err)
+		_ = tw.Close()
+		_ = gzw.Close()
+		_ = tmpF.Close()
+		fail(err) // deferred cleanup removes partial
 	}
 
-	// Flush & fsync, close writers/file
+	// Flush & fsync
 	if err := tw.Close(); err != nil {
-		close(logCh)
 		fail(err)
 	}
 	if err := gzw.Close(); err != nil {
-		close(logCh)
 		fail(err)
 	}
 	if err := tmpF.Sync(); err != nil {
-		close(logCh)
 		fail(err)
 	}
 	if err := tmpF.Close(); err != nil {
-		close(logCh)
 		fail(err)
 	}
 
-	// Logger beenden
-	close(logCh)
-
-	// Atomic rename to final name (same filesystem)
+	// Rename to final
 	if err := os.Rename(tmpPath, outPath); err != nil {
 		fail(fmt.Errorf("rename %q -> %q failed: %w", tmpPath, outPath, err))
 	}
 	committed = true
 
-	fmt.Printf("Wrote stream to %s\n", outPath)
+	// Final summary
+	log.Info().
+		Int64("files", atomic.LoadInt64(&filesDone)).
+		Str("bytes", humanBytes(atomic.LoadInt64(&bytesRead))).
+		Str("padded", humanBytes(atomic.LoadInt64(&bytesPadded))).
+		Str("elapsed", time.Since(startTime).Truncate(time.Second).String()).
+		Str("output", outPath).
+		Msg("archive complete")
 
-	// Prune after successful commit
+	// Prune after success
 	if *keep > 0 {
 		pattern := templateToGlob(*outTpl)
 		if pattern == "" {
@@ -286,9 +317,14 @@ func main() {
 		}
 		deleted, skippedCurrent, perr := pruneKeepExactlyNewestByMTime(pattern, *keep, outPath)
 		if perr != nil {
-			fmt.Fprintf(os.Stderr, "prune error: %v\n", perr)
+			log.Error().Err(perr).Msg("prune failed")
 		} else {
-			fmt.Printf("Prune: kept=%d, deleted=%d, skipped(current)=%d, pattern=%q\n", *keep, deleted, skippedCurrent, pattern)
+			log.Info().
+				Int("kept", *keep).
+				Int("deleted", deleted).
+				Int("skipped_current", skippedCurrent).
+				Str("pattern", pattern).
+				Msg("prune done")
 		}
 	}
 }
@@ -309,6 +345,7 @@ func streamFileToPipe(ctx context.Context, job *fileJob, bufPool *sync.Pool) err
 	return err
 }
 
+// copyExactly copies exactly want bytes, padding zeros if src ends early.
 func copyExactly(ctx context.Context, dst io.Writer, src io.Reader, want int64, buf []byte) (read int64, padded int64, err error) {
 	var done int64
 	for done < want {
@@ -402,11 +439,40 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader, buf []by
 	return written, nil
 }
 
+// ---- utils ----
+
+func entryType(info fs.FileInfo) string {
+	m := info.Mode()
+	switch {
+	case m.IsDir():
+		return "dir"
+	case m.IsRegular():
+		return "file"
+	case m&os.ModeSymlink != 0:
+		return "symlink"
+	default:
+		return "other"
+	}
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // ---- time substitutions & pruning ----
@@ -523,7 +589,7 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 		}
 		if remErr := os.Remove(it.path); remErr != nil {
 			err = remErr
-			fmt.Fprintf(os.Stderr, "prune: failed to remove %s: %v\n", it.path, remErr)
+			log.Warn().Err(remErr).Str("path", it.path).Msg("prune remove failed")
 			continue
 		}
 		deleted++
@@ -532,6 +598,6 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 }
 
 func fail(err error) {
-	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	log.Error().Err(err).Msg("fatal")
 	os.Exit(1)
 }
