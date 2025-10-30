@@ -9,11 +9,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/pgzip"
@@ -27,61 +30,123 @@ type fileJob struct {
 	pw   *io.PipeWriter
 }
 
+type logEvent struct {
+	Kind    string
+	Path    string
+	Size    int64
+	Read    int64
+	Padded  int64
+	Elapsed time.Duration
+	Err     error
+}
+
 func main() {
 	// ---- Flags ----
 	src := flag.String("src", "", "Source directory (required)")
 	outTpl := flag.String("out", "", "Output path template with time placeholders (required), e.g. backups/%F_%T.tar.gz")
 	keep := flag.Int("keep", 0, "Keep exactly N newest archives by mtime (0 disables pruning)")
+	logFile := flag.String("logfile", "", "Optional log file path (defaults to stderr)")
 	flag.Parse()
 
 	if *src == "" || *outTpl == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -src <dir> -out <template> [-keep N]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s -src <dir> -out <template> [-keep N] [-logfile path]\n", os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 
-	// Expand output path from template
+	// Final output name and temp (partial) name
 	outPath := strftimeLike(*outTpl, time.Now())
+	tmpPath := outPath + ".partial"
 	if dir := filepath.Dir(outPath); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fail(err)
 		}
 	}
 
-	// Open output + pgzip writer
-	outF, err := os.Create(outPath)
+	// Context cancels on SIGINT/SIGTERM -> ensures cleanup
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	eg, ctx := errgroup.WithContext(ctx)
+
+	// Open temp output; ensure removal on any failure/abort
+	tmpF, err := os.Create(tmpPath)
 	if err != nil {
 		fail(err)
 	}
-	defer outF.Close()
+	committed := false
+	defer func() {
+		// If we didn't rename successfully, remove partial
+		if !committed {
+			_ = tmpF.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	gzw := pgzip.NewWriter(outF)
-	gzw.SetConcurrency(1<<20, runtime.GOMAXPROCS(0)) // 1 MiB Blöcke, N Worker
+	gzw := pgzip.NewWriter(tmpF)
+	gzw.SetConcurrency(1<<20, runtime.GOMAXPROCS(0)) // 1 MiB blocks, N workers
 	defer gzw.Close()
 
 	tw := tar.NewWriter(gzw)
 	defer tw.Close()
 
-	// Context + errgroup
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	eg, ctx := errgroup.WithContext(ctx)
+	// ----- Async logger -----
+	logCh := make(chan logEvent, 2048)
+	var dropped uint64
+	eg.Go(func() error {
+		var w io.Writer = os.Stderr
+		if *logFile != "" {
+			if lf, e := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); e == nil {
+				defer lf.Close()
+				w = lf
+			} else {
+				fmt.Fprintf(os.Stderr, "logfile open failed (%v), using stderr\n", e)
+			}
+		}
+		for ev := range logCh {
+			switch ev.Kind {
+			case "header":
+				typ := "other"
+				if strings.HasSuffix(ev.Path, "/") {
+					typ = "dir"
+				}
+				fmt.Fprintf(w, "header: %s type=%s\n", ev.Path, typ)
+			case "copy":
+				if ev.Err != nil {
+					fmt.Fprintf(w, "copy:   %s size=%d read=%d padded=%d elapsed=%s ERROR=%v\n",
+						ev.Path, ev.Size, ev.Read, ev.Padded, ev.Elapsed.Truncate(time.Millisecond), ev.Err)
+				} else {
+					fmt.Fprintf(w, "copy:   %s size=%d read=%d padded=%d elapsed=%s\n",
+						ev.Path, ev.Size, ev.Read, ev.Padded, ev.Elapsed.Truncate(time.Millisecond))
+				}
+			default:
+				fmt.Fprintf(w, "log: %s\n", ev.Path)
+			}
+		}
+		if d := atomic.LoadUint64(&dropped); d > 0 {
+			fmt.Fprintf(w, "log: dropped %d events (logger buffer full)\n", d)
+		}
+		return nil
+	})
+	logAsync := func(ev logEvent) {
+		select {
+		case logCh <- ev:
+		default:
+			atomic.AddUint64(&dropped, 1)
+		}
+	}
 
-	// Channels: workCh für Worker, orderCh für den Writer (Erhalt der Reihenfolge)
+	// Work & order channels
 	workCh := make(chan *fileJob, runtime.GOMAXPROCS(0)*2)
 	orderCh := make(chan *fileJob, runtime.GOMAXPROCS(0)*2)
 
-	// Buffer-Pool
-	var bufPool = sync.Pool{
-		New: func() any { b := make([]byte, 256*1024); return &b }, // 256 KiB
-	}
+	// Buffer pool
+	var bufPool = sync.Pool{New: func() any { b := make([]byte, 256*1024); return &b }}
 
-	// Worker starten – Datei -> Pipe (parallel)
+	// Workers: stream file -> pipe
 	workers := max(2, runtime.GOMAXPROCS(0))
 	for i := 0; i < workers; i++ {
 		eg.Go(func() error {
 			for job := range workCh {
-				// nur Regular Files streamen; bei anderen Typen nur Header (Writer-Seite)
 				if job.info.Mode().IsRegular() {
 					if err := streamFileToPipe(ctx, job, &bufPool); err != nil {
 						job.pw.CloseWithError(err)
@@ -94,16 +159,17 @@ func main() {
 		})
 	}
 
-	// Writer: nacheinander Header schreiben & exakt die erwarteten Bytes aus Pipe lesen
+	// Writer: headers + exact bytes from pipe in order
 	eg.Go(func() error {
 		for job := range orderCh {
 			rel, _ := filepath.Rel(*src, job.path)
 			name := filepath.ToSlash(rel)
+			if job.info.IsDir() && !strings.HasSuffix(name, "/") {
+				name += "/"
+			}
 
-			// Header (inkl. erwarteter Größe für Regular Files)
 			var linkname string
 			if job.info.Mode()&os.ModeSymlink != 0 {
-				// Ziel des Symlinks ermitteln
 				if target, err := os.Readlink(job.path); err == nil {
 					linkname = target
 				}
@@ -119,26 +185,39 @@ func main() {
 				return err
 			}
 
-			// Nur Regular Files haben Daten; sicherstellen, dass GENAU hdr.Size Bytes ins TAR gehen.
-			if job.info.Mode().IsRegular() && hdr.Size > 0 {
-				buf := *bufPool.Get().(*[]byte)
-				if err := copyExactly(ctx, tw, job.pr, hdr.Size, buf); err != nil {
-					bufPool.Put(&buf)
-					job.pr.CloseWithError(err)
-					return err
-				}
-				bufPool.Put(&buf)
+			if !job.info.Mode().IsRegular() || hdr.Size == 0 {
+				logAsync(logEvent{Kind: "header", Path: name})
+				job.pr.Close()
+				continue
 			}
+
+			start := time.Now()
+			buf := *bufPool.Get().(*[]byte)
+			read, padded, cErr := copyExactly(ctx, tw, job.pr, hdr.Size, buf)
+			bufPool.Put(&buf)
 			job.pr.Close()
+
+			logAsync(logEvent{
+				Kind:    "copy",
+				Path:    name,
+				Size:    hdr.Size,
+				Read:    read,
+				Padded:  padded,
+				Elapsed: time.Since(start),
+				Err:     cErr,
+			})
+			if cErr != nil {
+				return cErr
+			}
 		}
 		return nil
 	})
 
-	// Walker: streamt „on the fly“ — kein Vorab-Collect
+	// Walker: on-the-fly
 	eg.Go(func() error {
 		defer close(workCh)
 		defer close(orderCh)
-		err := filepath.WalkDir(*src, func(p string, d fs.DirEntry, inErr error) error {
+		return filepath.WalkDir(*src, func(p string, d fs.DirEntry, inErr error) error {
 			if inErr != nil {
 				return inErr
 			}
@@ -147,7 +226,6 @@ func main() {
 				return ctx.Err()
 			default:
 			}
-			// Root relativ "." nicht als Eintrag erzwingen (optional)
 			rel, _ := filepath.Rel(*src, p)
 			if rel == "." {
 				return nil
@@ -156,33 +234,51 @@ func main() {
 			if err != nil {
 				return err
 			}
-
-			// Pipe je Eintrag
 			pr, pw := io.Pipe()
 			job := &fileJob{path: p, info: info, pr: pr, pw: pw}
-
-			// in fester Reihenfolge an den Writer…
 			orderCh <- job
-			// …und parallel in die Worker-Queue (die ggf. nichts tun bei Dir/Symlink)
 			workCh <- job
 			return nil
 		})
-		return err
 	})
 
-	// warten
+	// Wait for pipeline (cancels on signal)
 	if err := eg.Wait(); err != nil {
-		_ = tw.Close()
-		_ = gzw.Close()
-		_ = outF.Close()
-		removePartial(outPath)
+		// close logger and exit; deferred cleanup removes tmp
+		close(logCh)
 		fail(err)
 	}
 
-	_ = outF.Sync()
+	// Flush & fsync, close writers/file
+	if err := tw.Close(); err != nil {
+		close(logCh)
+		fail(err)
+	}
+	if err := gzw.Close(); err != nil {
+		close(logCh)
+		fail(err)
+	}
+	if err := tmpF.Sync(); err != nil {
+		close(logCh)
+		fail(err)
+	}
+	if err := tmpF.Close(); err != nil {
+		close(logCh)
+		fail(err)
+	}
+
+	// Logger beenden
+	close(logCh)
+
+	// Atomic rename to final name (same filesystem)
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		fail(fmt.Errorf("rename %q -> %q failed: %w", tmpPath, outPath, err))
+	}
+	committed = true
+
 	fmt.Printf("Wrote stream to %s\n", outPath)
 
-	// Pruning
+	// Prune after successful commit
 	if *keep > 0 {
 		pattern := templateToGlob(*outTpl)
 		if pattern == "" {
@@ -197,9 +293,8 @@ func main() {
 	}
 }
 
-// --- Helpers ---
+// ---- streaming helpers ----
 
-// Datei blockweise in die Pipe streamen
 func streamFileToPipe(ctx context.Context, job *fileJob, bufPool *sync.Pool) error {
 	f, err := os.Open(job.path)
 	if err != nil {
@@ -214,14 +309,12 @@ func streamFileToPipe(ctx context.Context, job *fileJob, bufPool *sync.Pool) err
 	return err
 }
 
-// Liest GENAU want Bytes von src und schreibt nach dst; bei Short-Read wird mit Nullen aufgefüllt.
-// So bleibt das TAR-Layout konsistent, selbst wenn eine Datei sich währenddessen verkürzt.
-func copyExactly(ctx context.Context, dst io.Writer, src io.Reader, want int64, buf []byte) error {
+func copyExactly(ctx context.Context, dst io.Writer, src io.Reader, want int64, buf []byte) (read int64, padded int64, err error) {
 	var done int64
 	for done < want {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return read, padded, ctx.Err()
 		default:
 		}
 		remain := want - done
@@ -232,30 +325,30 @@ func copyExactly(ctx context.Context, dst io.Writer, src io.Reader, want int64, 
 		if nr > 0 {
 			nw, ew := dst.Write(buf[:nr])
 			if ew != nil {
-				return ew
+				return read, padded, ew
 			}
 			if nw != nr {
-				return io.ErrShortWrite
+				return read, padded, io.ErrShortWrite
 			}
 			done += int64(nw)
+			read += int64(nw)
 			continue
 		}
 		if er != nil {
 			if errors.Is(er, io.EOF) {
-				// auffüllen
 				if remain := want - done; remain > 0 {
 					if err := zeroPad(dst, remain); err != nil {
-						return err
+						return read, padded, err
 					}
+					padded += remain
 					done = want
-					return nil
 				}
-				return nil
+				return read, padded, nil
 			}
-			return er
+			return read, padded, er
 		}
 	}
-	return nil
+	return read, padded, nil
 }
 
 func zeroPad(w io.Writer, n int64) error {
@@ -316,7 +409,7 @@ func max(a, b int) int {
 	return b
 }
 
-// --- Zeit-Platzhalter & Pruning (wie zuvor) ---
+// ---- time substitutions & pruning ----
 
 func strftimeLike(tpl string, t time.Time) string {
 	rep := []string{
@@ -380,8 +473,7 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 	if len(items) == 0 || keep == 0 {
 		return 0, 0, nil
 	}
-
-	sort.Slice(items, func(i, j int) bool { return items[i].mt.After(items[j].mt) }) // newest first
+	sort.Slice(items, func(i, j int) bool { return items[i].mt.After(items[j].mt) })
 	if len(items) <= keep {
 		return 0, 0, nil
 	}
@@ -417,7 +509,6 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 			}
 		}
 	}
-
 	for i, it := range items {
 		if _, keep := keepSet[i]; keep {
 			continue
@@ -438,12 +529,6 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 		deleted++
 	}
 	return deleted, skippedCurrent, err
-}
-
-func removePartial(path string) {
-	if path != "" {
-		_ = os.Remove(path)
-	}
 }
 
 func fail(err error) {
