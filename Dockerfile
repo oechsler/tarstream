@@ -8,4 +8,4 @@ WORKDIR /backup
 RUN mkdir -p /backup /archive
 COPY --from=build /tarstream /tarstream
 ENTRYPOINT ["/tarstream"]
-CMD ["-src", "/backup", "-out", "/archive/backup-%Y-%m-%d-%H-%M-%S.tar.gz", "-keep", "3"]
+CMD ["-src", "/backup", "-out", "/archive/backup-%Y-%m-%d.tar.gz", "-keep", "3"]
