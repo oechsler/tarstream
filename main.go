@@ -24,6 +24,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	// ---- Flags ----
 	src := flag.String("src", "", "Source directory (required)")
 	outTpl := flag.String("out", "", "Output path template with time placeholders (required), e.g. backups/%F_%T.tar.gz")
@@ -34,7 +38,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
 	logInterval := flag.Duration("log-interval", 15*time.Second, "Periodic summary interval (0 disables)")
 
-	// Performance- und RAM-Tuning (Defaults für ~128 MiB RAM)
+	// Defaults für ~128 MiB RAM
 	pgzLevel := flag.Int("pgzip-level", 3, "pgzip compression level (1-9)")
 	pgzBlock := flag.Int("pgzip-block", 1<<20, "pgzip block size in bytes (default 1MiB)")
 	pgzBlocks := flag.Int("pgzip-blocks", 8, "pgzip in-flight blocks (default 8)")
@@ -44,7 +48,7 @@ func main() {
 	if *src == "" || *outTpl == "" {
 		fmt.Fprintf(os.Stderr, "Usage: %s -src DIR -out TEMPLATE [options]\n", os.Args[0])
 		flag.PrintDefaults()
-		os.Exit(2)
+		return 2
 	}
 
 	// ---- Logger ----
@@ -81,7 +85,8 @@ func main() {
 	tmpPath := outPath + ".partial"
 	if dir := filepath.Dir(outPath); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			fail(err)
+			log.Error().Err(err).Msg("mkdir")
+			return 1
 		}
 	}
 
@@ -92,7 +97,8 @@ func main() {
 	// ---- Ausgabe öffnen ----
 	tmpF, err := os.Create(tmpPath)
 	if err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("create partial")
+		return 1
 	}
 	committed := false
 	defer func() {
@@ -106,7 +112,8 @@ func main() {
 	// ---- pgzip + tar ----
 	gzw, err := pgzip.NewWriterLevel(tmpF, clamp(*pgzLevel, 1, 9))
 	if err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("pgzip NewWriterLevel")
+		return 1
 	}
 	blk := clamp(*pgzBlock, 256<<10, 1<<20)              // 256KiB..1MiB
 	bls := clamp(*pgzBlocks, 2, 8*runtime.GOMAXPROCS(0)) // 2..8xCores
@@ -120,8 +127,9 @@ func main() {
 	start := time.Now()
 	type totals struct{ files, bytes, padded int64 }
 	t := totals{}
+	var ticker *time.Ticker
 	if *logInterval > 0 {
-		ticker := time.NewTicker(*logInterval)
+		ticker = time.NewTicker(*logInterval)
 		defer ticker.Stop()
 		go func() {
 			for {
@@ -140,7 +148,7 @@ func main() {
 		}()
 	}
 
-	// ---- Walk & Write (Writer-Pull, keine Pipes/Worker) ----
+	// ---- Walk & Write (Writer-Pull) ----
 	err = filepath.WalkDir(*src, func(p string, d fs.DirEntry, inErr error) error {
 		if inErr != nil {
 			return inErr
@@ -183,7 +191,7 @@ func main() {
 			return err
 		}
 
-		// Nur Regular Files haben Daten
+		// Nur reguläre Dateien haben Daten
 		if !info.Mode().IsRegular() || hdr.Size == 0 {
 			log.Debug().Str("path", name).Str("type", entryType(info)).Msg("header")
 			return nil
@@ -195,7 +203,7 @@ func main() {
 		}
 		defer f.Close()
 
-		buf := make([]byte, clamp(*bufSize, 64<<10, 32<<20)) // 64KiB..32MiB
+		buf := make([]byte, clamp(*bufSize, 64<<10, 32<<20))
 		startFile := time.Now()
 		read, padded, cErr := copyExactly(ctx, tw, f, hdr.Size, buf)
 		_ = f.Close()
@@ -217,24 +225,31 @@ func main() {
 		return cErr
 	})
 	if err != nil {
-		fail(err) // deferred cleanup entfernt .partial
+		// kein os.Exit hier → defers laufen, .partial wird gelöscht
+		log.Error().Err(err).Msg("walk/write failed")
+		return 1
 	}
 
 	// ---- Flush & fsync, dann atomisches Rename ----
 	if err := tw.Close(); err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("tar close")
+		return 1
 	}
 	if err := gzw.Close(); err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("gzip close")
+		return 1
 	}
 	if err := tmpF.Sync(); err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("fsync")
+		return 1
 	}
 	if err := tmpF.Close(); err != nil {
-		fail(err)
+		log.Error().Err(err).Msg("file close")
+		return 1
 	}
 	if err := os.Rename(tmpPath, outPath); err != nil {
-		fail(fmt.Errorf("rename %q -> %q failed: %w", tmpPath, outPath, err))
+		log.Error().Err(err).Str("from", tmpPath).Str("to", outPath).Msg("rename failed")
+		return 1
 	}
 	committed = true
 
@@ -256,15 +271,16 @@ func main() {
 		deleted, skippedCurrent, perr := pruneKeepExactlyNewestByMTime(pattern, *keep, outPath)
 		if perr != nil {
 			log.Error().Err(perr).Msg("prune failed")
-		} else {
-			log.Info().
-				Int("kept", *keep).
-				Int("deleted", deleted).
-				Int("skipped_current", skippedCurrent).
-				Str("pattern", pattern).
-				Msg("prune done")
+			return 1
 		}
+		log.Info().
+			Int("kept", *keep).
+			Int("deleted", deleted).
+			Int("skipped_current", skippedCurrent).
+			Str("pattern", pattern).
+			Msg("prune done")
 	}
+	return 0
 }
 
 // ---- Copy-Helpers ----
@@ -480,9 +496,4 @@ func pruneKeepExactlyNewestByMTime(pattern string, keep int, current string) (de
 		deleted++
 	}
 	return deleted, skippedCurrent, err
-}
-
-func fail(err error) {
-	log.Error().Err(err).Msg("fatal")
-	os.Exit(1)
 }
