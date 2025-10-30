@@ -66,7 +66,7 @@ func main() {
 	}
 	defer outF.Close()
 
-	gzw, _ := pgzip.NewWriter(outF)
+	gzw := pgzip.NewWriter(outF)                     // <-- fixed: only 1 return value
 	gzw.SetConcurrency(1<<20, runtime.GOMAXPROCS(0)) // 1 MiB blocks, N workers
 	defer gzw.Close()
 
@@ -153,10 +153,9 @@ func main() {
 		fail(err)
 	}
 
-	// fsync (best-effort)
-	if f, ok := outF.(*os.File); ok {
-		_ = f.Sync()
-	}
+	// fsync (best-effort) — <-- fixed: no type assertion needed
+	_ = outF.Sync()
+
 	fmt.Printf("Wrote %d files to %s\n", len(files), outPath)
 
 	// 9) Pruning (keep newest N; always keep current)
@@ -249,7 +248,7 @@ func max(a, b int) int {
 	return b
 }
 
-// ---- time substitutions & pruning (from your old code) ----
+// ---- time substitutions & pruning ----
 
 func strftimeLike(tpl string, t time.Time) string {
 	rep := []string{
