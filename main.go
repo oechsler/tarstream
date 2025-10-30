@@ -38,7 +38,7 @@ func run() int {
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
 	logInterval := flag.Duration("log-interval", 15*time.Second, "Periodic summary interval (0 disables)")
 
-	// Defaults für ~128 MiB RAM
+	// K8s-freundliche Defaults (~128 MiB RAM)
 	pgzLevel := flag.Int("pgzip-level", 3, "pgzip compression level (1-9)")
 	pgzBlock := flag.Int("pgzip-block", 1<<20, "pgzip block size in bytes (default 1MiB)")
 	pgzBlocks := flag.Int("pgzip-blocks", 8, "pgzip in-flight blocks (default 8)")
@@ -212,20 +212,29 @@ func run() int {
 		t.bytes += read
 		t.padded += padded
 
-		ev := log.Info()
 		if cErr != nil {
-			ev = log.Error().Err(cErr)
+			log.Error().
+				Err(cErr).
+				Str("path", name).
+				Int64("size", hdr.Size).
+				Int64("read", read).
+				Int64("padded", padded).
+				Str("elapsed", time.Since(startFile).Truncate(time.Millisecond).String()).
+				Msg("file")
+			return cErr
 		}
-		ev.Str("path", name).
+
+		// success → DEBUG statt INFO
+		log.Debug().
+			Str("path", name).
 			Int64("size", hdr.Size).
 			Int64("read", read).
 			Int64("padded", padded).
 			Str("elapsed", time.Since(startFile).Truncate(time.Millisecond).String()).
 			Msg("file")
-		return cErr
+		return nil
 	})
 	if err != nil {
-		// kein os.Exit hier → defers laufen, .partial wird gelöscht
 		log.Error().Err(err).Msg("walk/write failed")
 		return 1
 	}
